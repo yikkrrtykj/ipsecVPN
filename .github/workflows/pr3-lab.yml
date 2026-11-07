@@ -1,0 +1,41 @@
+name: PR3 isolated IPsec data plane
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'ipsecvpn/**'
+      - 'scripts/pr3-lab/**'
+      - 'scripts/pr2-vm/**'
+      - '.github/workflows/pr3-lab.yml'
+      - 'config/**'
+      - 'pyproject.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-ipsec:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+      - name: ShellCheck isolated VM launcher
+        run: shellcheck scripts/pr2-vm/*.sh
+      - name: Run three-node experiment in a disposable VM
+        env:
+          IPSECVPN_EVIDENCE_FILE: ${{ runner.temp }}/ipsecvpn-pr3-acceptance.jsonl
+        run: bash scripts/pr2-vm/run.sh pr3
+      - name: Save sanitized case receipts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ipsecvpn-pr3-lab-evidence
+          path: ${{ runner.temp }}/ipsecvpn-pr3-acceptance.jsonl

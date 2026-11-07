@@ -19,9 +19,18 @@ from .installer import (
     vendor_plugins,
     verify_install_source,
 )
+from .live import (
+    assert_baseline,
+    configure_scoped,
+    drain_links,
+    initiate_link,
+    owned_resources,
+    rekey_link,
+)
 from .profile import MAX_PROFILE_BYTES, load_profile, parse_profile
 from .renderer import build_manifest, canonical, digest, external_backup, resource_diff
 from .resources import Resources, link_specs, network_scope
+from .sa import inventory
 from .secureio import Stop, make_directory, read_file, read_keys, read_record, write_record
 
 LOCK = Path("/run/ipsecvpn.lock")
@@ -32,7 +41,8 @@ JOURNAL = STATE / "journal.json"
 BACKUPS = STATE / "backups"
 HISTORY = STATE / "journals"
 PROFILES = Path("/etc/ipsecvpn/profiles")
-TERMINAL = {"COMMITTED", "RESTORED"}
+RECONNECT = STATE / "reconnect.json"
+TERMINAL = {"COMMITTED", "RESTORED", "CONFIGURATION_RESTORED"}
 
 
 def now():
@@ -205,7 +215,7 @@ class Deployment:
         self.phase("SNAPSHOTTED")
         self.host.step = self.step
 
-    def recover(self):
+    def recover(self, *, maintenance=False):
         self.phase("RESTORING")
         self.host.step = self.step
         before = self.record["before"]
@@ -236,6 +246,15 @@ class Deployment:
                     verify_install_source(self.host, None, self.host.package_state())
                 else:
                     verify_install_source(self.host, install, self.host.package_state())
+            elif self.record.get("live_maintenance"):
+                if not maintenance:
+                    raise Stop(
+                        "Active deployment recovery needs an explicit maintenance rollback; "
+                        "business recovery is unverified."
+                    )
+                self.recover_live(before, target, install)
+                self.phase("CONFIGURATION_RESTORED")
+                return
             else:
                 old = snapshot(before)
                 requested = snapshot(target)
@@ -341,7 +360,7 @@ class Deployment:
             "baseline_unchanged": True,
         }
 
-    def change(self, action, profile, identifier, confirmed):
+    def change(self, action, profile, identifier, confirmed, maintenance=False):
         install = installed_record()
         active = read_record(ACTIVE)
         before = snapshot(active)
@@ -362,12 +381,21 @@ class Deployment:
             requested = target = None
         resources = Resources(self.host, install["token"], (before, target))
         owned_names = {name for name, _ in link_specs((before,))}
-        self.host.assert_exclusive_ike(owned_names)
+        pid = self.host.assert_daemon(owned_names)
         baseline = resources.preflight(target)
-        resources.verify(before, baseline, active.get("nft_sha256") if active else None)
+        assert_baseline(active, baseline)
+        live = inventory(self.host, before, pid)
+        resources.verify(before, baseline, active.get("nft_sha256") if active else None, live=live)
         result = {"status": "PASS", "diff": resource_diff(before, target)}
         if backup_state is not None:
             result["backup"] = backup_state
+        if live.ikes:
+            result["maintenance"] = {
+                "required_for_changes": True,
+                "interruption": "PROJECT_TUNNELS_MAY_DISCONNECT",
+                "sites": [link.site_id for link in before.links],
+                "protected_cidrs": network_scope((before, target)),
+            }
         if not confirmed:
             return {**result, "detail": "Dry-run; host resources and credentials were not changed."}
 
@@ -376,25 +404,54 @@ class Deployment:
             keys = read_keys(profile)
             requested["keys"] = key_digests(keys)
             if active and active["profile"] == profile and active["keys"] == requested["keys"]:
+                result.pop("maintenance", None)
                 return {**result, "detail": "NOOP: the active profile and live resources match."}
         else:
             keys = keys_for(requested)
+        if live.ikes and not maintenance:
+            raise Stop("Active project SAs require --maintenance for a configuration change.")
+        if not live.ikes:
+            self.host.assert_exclusive_ike(owned_names)
 
         self.begin(action, active, requested, install, baseline)
         try:
+            if live.ikes:
+                self.record["live_maintenance"] = True
+                self.record["live_sites"] = [
+                    link.site_id
+                    for link in before.links
+                    if live.get(link.name) and live.get(link.name).child
+                ]
             self.phase("STAGED")
             self.phase("APPLYING")
-            resources.replace(target, keys)
-            observed = resources.verify(target, baseline)
+            if live.ikes:
+                observed = self.replace_live(resources, before, target, keys, pid, live)
+            else:
+                resources.replace(target, keys)
+                observed = resources.verify(target, baseline)
             if requested:
-                requested = {**requested, "nft_sha256": observed}
+                requested = {**requested, "nft_sha256": observed, "host_baseline": baseline}
             write_record(ACTIVE, requested)
             if action == "uninstall":
                 deactivate(self.host, install)
+                if live.ikes:
+                    resources.finish(None)
                 if resources.baseline() != baseline:
                     raise Stop("Uninstall changed a protected host baseline.")
                 write_record(RETAINED, {"uninstall_id": self.record["id"]})
                 write_record(INSTALLED, None)
+                if live.ikes:
+                    write_record(RECONNECT, None)
+            elif live.ikes:
+                remember_sites(
+                    install,
+                    requested,
+                    {
+                        link.site_id
+                        for link in target.links
+                        if link.site_id in self.record["live_sites"]
+                    },
+                )
             self.phase("VERIFIED")
             self.phase("COMMITTED")
         except (Stop, OSError, ValueError, KeyError) as exc:
@@ -407,6 +464,9 @@ class Deployment:
             ) from None
         finally:
             self.host.step = None
+        if action == "rollback":
+            result["configuration_restored"] = True
+            result["data_path_restored"] = {"status": "SKIP", "reason_code": "NO_PROBE"}
         return {
             **result,
             "detail": "COMMITTED: project resources verified.",
@@ -415,14 +475,58 @@ class Deployment:
             "site_to_site": {"status": "SKIP"},
         }
 
+    def replace_live(self, resources, before, target, keys, pid, live):
+        resources.guard(handshake=before)
+        self.step("VICI targeted drain", "STARTED")
+        drain_links(self.host, before, pid, live)
+        self.step("VICI targeted drain", "DONE")
+
+        def loader(model, credentials):
+            self.step("VICI scoped load", "STARTED")
+            configure_scoped(self.host, pid, resources.candidates, model, credentials)
+            self.step("VICI scoped load", "DONE")
+
+        resources.replace(target, keys, loader=loader, hold=True)
+        if target is None:
+            return None  # Keep the transition guards until the daemon is disabled.
+        for link in target.links:
+            if link.site_id in self.record["live_sites"]:
+                self.step("VICI targeted reconnect", "STARTED")
+                initiate_link(self.host, target, pid, link)
+                self.step("VICI targeted reconnect", "DONE")
+        snapshot_live = inventory(self.host, target, pid)
+        resources.finish(target)
+        return resources.verify(target, self.record["baseline"], live=snapshot_live)
+
+    def recover_live(self, before, target, install):
+        original, requested = snapshot(before), snapshot(target)
+        resources = Resources(self.host, install["token"], (original, requested))
+        pid = self.host.assert_daemon({name for name, _ in resources.links})
+        if resources.preflight(original) != self.record["baseline"]:
+            raise Stop("The protected baseline changed during the maintenance transaction.")
+        for model in (original, requested):
+            try:
+                live = inventory(self.host, model, pid)
+                break
+            except Stop:
+                continue
+        else:
+            raise Stop("Current SAs cannot be attributed to either journaled manifest.")
+        observed = self.replace_live(resources, model, original, keys_for(before), pid, live)
+        restored = {**before, "nft_sha256": observed, "host_baseline": self.record["baseline"]}
+        write_record(ACTIVE, restored)
+        write_record(INSTALLED, install)
+        remember_sites(install, restored, self.record["live_sites"])
+        self.record["configuration_restored"] = True
+        self.record["data_path_restored"] = {"status": "SKIP", "reason_code": "NO_PROBE"}
+
     def backup(self, confirmed):
         install = installed_record()
         active = read_record(ACTIVE)
         manifest = snapshot(active)
         resources = Resources(self.host, install["token"], (manifest,))
         baseline = resources.preflight(manifest)
-        self.host.assert_exclusive_ike({name for name, _ in link_specs((manifest,))})
-        resources.verify(manifest, baseline, active.get("nft_sha256") if active else None)
+        owned_resources(self.host, install, active)
         if not confirmed:
             return {"status": "PASS", "detail": "Dry-run; no snapshot written."}
         keys_for(active)
@@ -438,14 +542,79 @@ class Deployment:
         )
         return {"status": "PASS", "detail": "Project snapshot verified.", "backup_id": identifier}
 
-    def dispatch(self, action, confirmed, config=None, identifier=None):
+    def sa_operation(self, action, site, kind, confirmed):
+        install = installed_record()
+        active = read_record(ACTIVE)
+        manifest, live, pid = owned_resources(self.host, install, active)
+        link = (
+            next((item for item in manifest.links if item.site_id == site), None)
+            if manifest
+            else None
+        )
+        if not link:
+            raise Stop("Select a site in the current active profile.")
+        old = live.get(link.name)
+        if action == "rekey" and (not old or not old.child):
+            raise Stop("Rekey requires a verified established IKE and CHILD SA.")
+        plan = {"status": "PASS", "site_id": site, "data_path": {"status": "SKIP"}}
+        if not confirmed:
+            return {**plan, "detail": "Dry-run; no SA was changed."}
+        keys_for(active)
+        identifier = uuid.uuid4().hex
+        journal = HISTORY / f"{identifier}.json"
+        audit = {
+            "id": identifier,
+            "site_id": site,
+            "action": action,
+            "owner": install["token"],
+            "time": now(),
+            "phase": "STARTED",
+            "rekey_kind": kind,
+        }
+        write_record(journal, audit)
+        try:
+            if action == "rekey":
+                rekey_link(self.host, manifest, pid, link, old, kind)
+            else:
+                if not old or not old.child:
+                    initiate_link(self.host, manifest, pid, link)
+                desired = reconnect_sites(install, active)
+                remember_sites(install, active, desired | {site})
+        except Stop as exc:
+            write_record(
+                journal,
+                {
+                    **audit,
+                    "phase": "FAILED",
+                    "reason_code": getattr(exc, "reason", "UNVERIFIED_SA"),
+                },
+            )
+            raise
+        write_record(journal, {**audit, "phase": "VERIFIED"})
+        return {
+            **plan,
+            "journal": identifier,
+            "detail": "Verified target CHILD. Business untested.",
+        }
+
+    def dispatch(
+        self,
+        action,
+        confirmed,
+        config=None,
+        identifier=None,
+        *,
+        maintenance=False,
+        site=None,
+        kind=None,
+    ):
         self.host.probe()
         if not confirmed:
-            return self._dispatch(action, False, config, identifier)
+            return self._dispatch(action, False, config, identifier, maintenance, site, kind)
         with locked():
-            return self._dispatch(action, True, config, identifier)
+            return self._dispatch(action, True, config, identifier, maintenance, site, kind)
 
-    def _dispatch(self, action, confirmed, config, identifier):
+    def _dispatch(self, action, confirmed, config, identifier, maintenance, site, kind):
         pending = read_record(JOURNAL)
         if pending and pending["phase"] not in TERMINAL:
             if action != "rollback" or identifier != pending["id"]:
@@ -456,15 +625,49 @@ class Deployment:
                 read_backup(identifier)
             if not confirmed:
                 return {"status": "PASS", "detail": "Dry-run; pending recovery is still blocked."}
+            if pending.get("live_maintenance") and not maintenance:
+                raise Stop("Use --maintenance to recover this interrupted live transaction.")
             self.record = pending
-            self.recover()
+            self.recover(maintenance=maintenance)
+            if self.record["phase"] == "CONFIGURATION_RESTORED":
+                return {
+                    "status": "PASS",
+                    "detail": "Configuration and owned SA recovery verified; business untested.",
+                    "configuration_restored": True,
+                    "data_path_restored": self.record["data_path_restored"],
+                }
             return {"status": "PASS", "detail": "RESTORED: interrupted transaction recovered."}
         if action == "install":
             return self.install(confirmed)
         if action == "backup":
             return self.backup(confirmed)
+        if action in {"initiate", "rekey"}:
+            return self.sa_operation(action, site, kind, confirmed)
         profile = read_profile(config, confirmed) if action == "apply" else None
-        return self.change(action, profile, identifier, confirmed)
+        return self.change(action, profile, identifier, confirmed, maintenance)
+
+
+def reconnect_sites(install, active):
+    wanted = read_record(RECONNECT)
+    if (
+        wanted
+        and active
+        and wanted["owner"] == install["token"]
+        and wanted["profile_sha256"] == digest(canonical(active["profile"]))
+    ):
+        return set(wanted["sites"])
+    return set()
+
+
+def remember_sites(install, active, sites):
+    write_record(
+        RECONNECT,
+        {
+            "owner": install["token"],
+            "profile_sha256": digest(canonical(active["profile"])),
+            "sites": sorted(sites),
+        },
+    )
 
 
 def boot(phase):
@@ -483,6 +686,7 @@ def boot(phase):
             return
         resources = Resources(host, install["token"], candidates)
         if phase == "guard":
+            host.assert_no_other_ike()
             resources.guard()
             resources.purge_runtime()
         elif interrupted:
@@ -496,3 +700,15 @@ def boot(phase):
             baseline = resources.preflight(target)
             resources.replace(target, keys_for(active))
             resources.verify(target, baseline, active.get("nft_sha256") if active else None)
+            wanted = reconnect_sites(install, active)
+            if wanted:
+                pid = host.assert_daemon({link.name for link in target.links})
+                failures = []
+                for link in target.links:
+                    if link.site_id in wanted:
+                        try:
+                            initiate_link(host, target, pid, link)
+                        except Stop:
+                            failures.append(link.site_id)
+                if failures:
+                    raise Stop("An explicitly requested site did not reconnect; guards remain.")

@@ -7,13 +7,14 @@ import secrets
 import signal
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from ipaddress import collapse_addresses, ip_network
 from pathlib import Path
 
 import yaml
 
-from ipsecvpn.host import UNIT, VICI_PATH, Host, fingerprint
+from ipsecvpn.host import UNIT, VICI_PATH, Host, fingerprint, separate_nft
 from ipsecvpn.installer import GUARD, RESTORE, STATE
 from ipsecvpn.profile import load_profile
 from ipsecvpn.renderer import build_manifest
@@ -672,6 +673,9 @@ def before_reboot():
         {**baseline, "foreign_service_units": sorted(services), "foreign_service_pids_equal": True},
     )
     check_secret_evidence(profile)
+    (HERE / "nft-before-reboot.json").write_text(
+        json.dumps(separate_nft(HOST.nft())[0]), encoding="utf-8"
+    )
 
 
 def check_secret_evidence(profile):
@@ -709,9 +713,44 @@ def after_reboot():
     )
     saved = json.loads(BASELINE.read_text(encoding="utf-8"))
     baseline = saved["network"]
+    # is-active with several units succeeds when any one is active. Wait for every
+    # automatic oneshot to finish without manually starting or repairing a unit.
+    deadline = time.monotonic() + 90
+    while True:
+        states = {unit: HOST.service(unit, "ActiveState") for unit in (GUARD, RESTORE, UNIT)}
+        if all(state == "active" for state in states.values()):
+            break
+        assert "failed" not in states.values() and time.monotonic() < deadline, states
+        time.sleep(1)
     command("systemctl", "is-active", GUARD, RESTORE, UNIT)
     manifest = current_manifest()
-    resources(manifest).verify(manifest, baseline, read_record(ACTIVE)["nft_sha256"])
+    try:
+        resources(manifest).verify(manifest, baseline, read_record(ACTIVE)["nft_sha256"])
+    except Stop:
+        emit(
+            "REBOOT_DIAGNOSTIC",
+            "FAIL",
+            "Project firewall after reboot matches the recorded configuration.",
+            {
+                "recorded_sha256": read_record(ACTIVE)["nft_sha256"],
+                "before_objects": json.loads((HERE / "nft-before-reboot.json").read_text()),
+                "after_objects": separate_nft(HOST.nft())[0],
+                "boot_units": command(
+                    "journalctl",
+                    "--no-pager",
+                    "-b",
+                    "-u",
+                    GUARD,
+                    "-u",
+                    RESTORE,
+                    "-n",
+                    "30",
+                    "-o",
+                    "cat",
+                ).stdout,
+            },
+        )
+        raise
     services = foreign_services()
     for unit, row in services.items():
         assert all(

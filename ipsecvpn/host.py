@@ -184,11 +184,16 @@ class Host:
         listeners = self.command("VICI listener probe", "ss", "-H", "-xlpn")
         return [line for line in listeners.splitlines() if str(VICI_PATH) in line.split()]
 
-    def assert_no_other_ike(self):
+    def assert_no_starter(self):
         if self.service("strongswan-starter.service", "ActiveState") not in {"inactive", "failed"}:
             raise Stop("A legacy strongSwan starter unit is active.")
+
+    def assert_no_other_ike(self):
+        self.assert_no_starter()
         if self.command("XFRM SA probe", "ip", "xfrm", "state", "list", "nokeys").strip():
             raise Stop("An active kernel IPsec SA exists. Use a dedicated idle VM.")
+        if self.command("XFRM SPD probe", "ip", "xfrm", "policy", "list", "nosock").strip():
+            raise Stop("An unexpected global XFRM policy exists.")
 
     def assert_idle_ike(self):
         self.assert_no_other_ike()
@@ -203,6 +208,12 @@ class Host:
 
     def assert_exclusive_ike(self, permitted=()):
         self.assert_no_other_ike()
+        self.assert_daemon(permitted)
+        if self.vici("--list-sas").strip():
+            raise Stop("Active SAs prevent changes that require an idle daemon.")
+
+    def assert_daemon(self, permitted=()):
+        self.assert_no_starter()
         if self.service(UNIT, "FragmentPath") not in VENDOR_UNITS:
             raise Stop("The strongSwan unit is not the expected Ubuntu unit.")
         if self.service(UNIT, "DropInPaths") != str(DROPIN):
@@ -215,13 +226,15 @@ class Host:
         if state != "active" or not pid.isdecimal() or int(pid) <= 0 or not ports:
             raise Stop("The owned charon-systemd service and IKE sockets are not active.")
         self.assert_private_daemon(pid)
-        if any(set(re.findall(r"pid=(\d+),", line)) != {pid} for line in ports):
-            raise Stop("A foreign process owns an IKE socket.")
+        vici = self.vici_listeners()
+        if not vici or any(set(re.findall(r"pid=(\d+),", line)) != {pid} for line in ports + vici):
+            raise Stop("The daemon does not exclusively own the IKE and VICI sockets.")
         output = self.vici("--version", "--daemon")
         if not re.search(r"\b5\.9\.\d+\b", output) or "charon-systemd" not in output:
             raise Stop("VICI did not report the expected strongSwan 5.9.x version.")
-        if self.vici("--list-sas").strip() or not self.vici_names().issubset(permitted):
-            raise Stop("Active SAs or unowned VICI connections prevent safe changes.")
+        if not self.vici_names().issubset(permitted):
+            raise Stop("Unowned VICI connections prevent safe changes.")
+        return pid
 
     def assert_private_daemon(self, pid):
         if not pid.isdecimal() or int(pid) <= 0:

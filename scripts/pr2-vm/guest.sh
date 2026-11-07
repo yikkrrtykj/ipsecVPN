@@ -4,7 +4,13 @@ set -euo pipefail
 systemd-detect-virt --vm
 # shellcheck disable=SC1091
 . /etc/os-release
-if [[ "$ID" != ubuntu || "$VERSION_ID" != 24.04 || "$(hostname)" != ipsecvpn-pr2-lab ]]; then
+suite="${1:-pr2}"
+case "$suite" in
+    pr2) extra_packages=() ;;
+    pr3) extra_packages=(tcpdump) ;;
+    *) exit 2 ;;
+esac
+if [[ "$ID" != ubuntu || "$VERSION_ID" != 24.04 || "$(hostname)" != "ipsecvpn-$suite-lab" ]]; then
     printf '%s\n' 'STOP: guest identity or release does not match the disposable lab.' >&2
     exit 1
 fi
@@ -17,7 +23,7 @@ if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
 fi
 printf 'deb [trusted=yes] file:/opt/ipsecvpn-lab/apt ./\n' > /etc/apt/sources.list.d/lab.list
 apt-get -qq update
-apt-get -qq install -y --no-install-recommends nftables python3-venv iptables ufw
+apt-get -qq install -y --no-install-recommends nftables python3-venv iptables ufw "${extra_packages[@]}"
 python3 -m venv /opt/ipsecvpn-lab/venv
 /opt/ipsecvpn-lab/venv/bin/python -m pip install --no-index \
     --find-links=/opt/ipsecvpn-lab/wheels ipsecvpn

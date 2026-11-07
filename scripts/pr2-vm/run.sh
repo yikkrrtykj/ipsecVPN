@@ -2,6 +2,12 @@
 # A disposable QEMU guest. Host sudo installs tooling only, with no host network changes.
 set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+suite="${1:-pr2}"
+case "$suite" in
+    pr2) extra_packages=() ;;
+    pr3) extra_packages=(tcpdump) ;;
+    *) printf '%s\n' 'Unknown isolated VM suite.' >&2; exit 2 ;;
+esac
 work="$(mktemp -d)"
 pidfile="$work/qemu.pid"
 known_hosts="$work/known_hosts"
@@ -13,10 +19,17 @@ guest() { ssh "${ssh_options[@]}" -p 2222 ubuntu@127.0.0.1 "$@"; }
 cleanup() {
     code=$?
     trap - EXIT
-    if guest 'sudo cat /var/tmp/ipsecvpn-acceptance.jsonl' > "$work/acceptance.jsonl" 2>/dev/null; then
+    evidence=/var/tmp/ipsecvpn-acceptance.jsonl
+    if [[ "$suite" == pr3 ]]; then
+        evidence=/var/tmp/ipsecvpn-pr3-acceptance.jsonl
+        guest 'sudo /opt/ipsecvpn-lab/venv/bin/python /opt/ipsecvpn-lab/verify.py summarize' \
+            >/dev/null 2>&1 || true
+    fi
+    if guest "sudo cat $evidence" > "$work/acceptance.jsonl" 2>/dev/null; then
         cat "$work/acceptance.jsonl"
         if [[ -n "${IPSECVPN_EVIDENCE_FILE:-}" ]]; then
-            cp "$work/acceptance.jsonl" "$IPSECVPN_EVIDENCE_FILE" || +                printf '%s\n' 'Could not save the JSONL artifact. Evidence remains in the job log.' >&2
+            cp "$work/acceptance.jsonl" "$IPSECVPN_EVIDENCE_FILE" ||
+                printf '%s\n' 'Could not save the JSONL artifact. Evidence remains in the job log.' >&2
         fi
     fi
     if [[ -s "$pidfile" ]]; then kill -- "$(cat "$pidfile")" 2>/dev/null || true; fi
@@ -31,7 +44,13 @@ sudo apt-get "${apt_network[@]}" -qq install -y --no-install-recommends \
     qemu-system-x86 qemu-utils cloud-image-utils dpkg-dev
 mkdir -p "$work/payload/apt" "$work/payload/wheels" "$work/apt-archives"
 python -m pip wheel --wheel-dir "$work/payload/wheels" "$root"
-cp "$root"/scripts/pr2-vm/{guest.sh,verify.py} "$work/payload/"
+cp "$root"/scripts/pr2-vm/guest.sh "$work/payload/"
+if [[ "$suite" == pr3 ]]; then
+    cp "$root"/scripts/pr3-lab/{verify.py,topology.py,traffic.py,topology.json} "$work/payload/"
+    git -C "$root" rev-parse HEAD > "$work/payload/head-sha"
+else
+    cp "$root"/scripts/pr2-vm/verify.py "$work/payload/"
+fi
 cp "$root/config/event.example.yaml" "$work/payload/example.yaml"
 
 image=noble-server-cloudimg-amd64.img
@@ -45,7 +64,7 @@ qemu-img resize "$work/$image" 10G
 ssh-keygen -q -t ed25519 -N '' -f "$work/key"
 printf '#cloud-config\nssh_authorized_keys:\n  - %s\npackage_update: false\npackage_upgrade: false\n' \
     "$(cat "$work/key.pub")" > "$work/user-data"
-printf 'instance-id: ipsecvpn-pr2-lab\nlocal-hostname: ipsecvpn-pr2-lab\n' > "$work/meta-data"
+printf 'instance-id: ipsecvpn-%s-lab\nlocal-hostname: ipsecvpn-%s-lab\n' "$suite" "$suite" > "$work/meta-data"
 cat > "$work/network-config" <<'EOF'
 version: 2
 ethernets:
@@ -84,11 +103,11 @@ guest 'cat /var/lib/dpkg/status' > "$work/guest-dpkg-status"
 sudo apt-get "${apt_network[@]}" -qq -y --download-only --no-install-recommends \
     -o "Dir::State::status=$work/guest-dpkg-status" -o "Dir::Cache::archives=$work/apt-archives" \
     install charon-systemd strongswan-swanctl libstrongswan-standard-plugins \
-    nftables iproute2 python3-venv iptables ufw
+    nftables iproute2 python3-venv iptables ufw "${extra_packages[@]}"
 cp "$work"/apt-archives/*.deb "$work/payload/apt/"
 (cd "$work/payload/apt" && dpkg-scanpackages -m . /dev/null > Packages)
 scp "${ssh_options[@]}" -P 2222 -r "$work/payload" ubuntu@127.0.0.1:lab
-guest 'sudo bash /home/ubuntu/lab/guest.sh'
+guest "sudo bash /home/ubuntu/lab/guest.sh $suite"
 before="$(guest 'cat /proc/sys/kernel/random/boot_id')"
 guest 'sudo systemctl reboot --no-block' || true
 for _ in {1..100}; do

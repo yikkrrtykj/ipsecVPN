@@ -1,4 +1,4 @@
-"""Read-only CLI for the V2.0 profile and handoff workflow."""
+"""V2.0 profile, handoff and authorized Ubuntu lab Hub operations."""
 
 import argparse
 import json
@@ -8,6 +8,7 @@ import shutil
 import sys
 from pathlib import Path
 
+from .diagnostics import status_report
 from .handoff import build_plan, peer_parameters, render_peer_markdown
 from .profile import ProfileError, backup_readiness, load_profile
 from .renderer import render
@@ -15,7 +16,7 @@ from .secureio import Stop
 from .transaction import Deployment
 
 DEFAULT_PROFILES = Path("/etc/ipsecvpn/profiles")
-HOST_ACTIONS = ("install", "apply", "backup", "rollback", "uninstall")
+HOST_ACTIONS = ("install", "apply", "backup", "rollback", "uninstall", "initiate", "rekey")
 
 
 def _check(check_id, status, detail):
@@ -101,6 +102,9 @@ def _parser():
     validate.add_argument("--json", action="store_true")
     check = commands.add_parser("check", help="Inspect local host prerequisites only.")
     check.add_argument("--json", action="store_true")
+    for name in ("status", "doctor"):
+        observation = commands.add_parser(name, help="Inspect the installed Hub without probes.")
+        observation.add_argument("--json", action="store_true")
     plan = commands.add_parser("plan", help="Print a read-only topology plan as JSON.")
     plan.add_argument("-c", "--config", type=Path, required=True)
     export = commands.add_parser("export-peer", help="Print a site-side handoff.")
@@ -123,18 +127,34 @@ def _parser():
             operation.add_argument("-c", "--config", type=Path, required=True)
         if action == "rollback":
             operation.add_argument("--to", required=True)
+        if action in {"apply", "rollback", "uninstall"}:
+            operation.add_argument("--maintenance", action="store_true")
+        if action in {"initiate", "rekey"}:
+            operation.add_argument("--site", required=True)
+        if action == "rekey":
+            kind = operation.add_mutually_exclusive_group(required=True)
+            kind.add_argument("--child", dest="kind", action="store_const", const="child")
+            kind.add_argument("--ike", dest="kind", action="store_const", const="ike")
     return parser
 
 
 def _run(args):
     if args.command in HOST_ACTIONS:
         return Deployment().dispatch(
-            args.command, args.confirm, getattr(args, "config", None), getattr(args, "to", None)
+            args.command,
+            args.confirm,
+            getattr(args, "config", None),
+            getattr(args, "to", None),
+            maintenance=getattr(args, "maintenance", False),
+            site=getattr(args, "site", None),
+            kind=getattr(args, "kind", None),
         )
     if args.command == "profiles":
         return list_profiles(args.directory)
     if args.command == "check":
         return check_host()
+    if args.command in {"status", "doctor"}:
+        return status_report()
     config = args.config
     if args.command == "export-peer" and config is None:
         config = os.environ.get("IPSECVPN_CONFIG")
@@ -155,7 +175,16 @@ def _run(args):
 
 
 def _print_text(result):
-    print(result["status"], result.get("detail", ""))
+    print(
+        "FAIL/STOP" if result.get("decision") == "STOP" else result["status"],
+        result.get("detail", ""),
+    )
+    for site in result.get("sites", []):
+        if "ike_state" in site:
+            print(
+                f"{site['site_id']} IKE={site['ike_state']} CHILD={site['child_state']} "
+                f"business={site['data_path']['status']}"
+            )
     for key in ("journal", "backup_id"):
         if key in result:
             print(f"{key} {result[key]}")
@@ -206,6 +235,8 @@ def main(argv=None):
             else "A protected host check or state operation failed."
         )
         result = {"status": "FAIL", "decision": "STOP", "detail": detail}
+        if hasattr(exc, "reason"):
+            result["reason_code"] = exc.reason
         if not json_output:
             print(f"FAIL/STOP {detail}", file=sys.stderr)
             return 1

@@ -117,60 +117,67 @@ def build_manifest(profile):
     )
 
 
+def connection_settings(link):
+    return {
+        "version": "2",
+        "local_addrs": [link.source],
+        "remote_addrs": [link.peer],
+        "proposals": [link.ike_proposal],
+        "reauth_time": "0",
+        "rekey_time": f"{link.ike_lifetime}s",
+        "dpd_delay": f"{link.dpd_delay}s",
+        "mobike": "no",
+        "encap": "yes",
+        "local": {"auth": "psk", "id": link.local_id},
+        "remote": {"auth": "psk", "id": link.remote_id},
+        "children": {
+            link.child: {
+                "mode": "tunnel",
+                "local_ts": list(link.local_ts),
+                "remote_ts": list(link.remote_ts),
+                "esp_proposals": [link.esp_proposal],
+                "if_id_in": str(link.if_id),
+                "if_id_out": str(link.if_id),
+                "life_time": f"{link.child_lifetime}s",
+                "rekey_time": f"{max(1, link.child_lifetime * 9 // 10)}s",
+                "start_action": "none",
+                "dpd_action": "clear",
+                "close_action": "none",
+            }
+        },
+    }
+
+
+def _config_lines(section, indent=""):
+    for key, value in section.items():
+        if isinstance(value, dict):
+            yield f"{indent}{key} {{"
+            yield from _config_lines(value, indent + "    ")
+            yield f"{indent}}}"
+        else:
+            formatted = ", ".join(value) if isinstance(value, list) else value
+            yield f"{indent}{key} = {formatted}"
+
+
 def swanctl_config(manifest, keys=None):
-    """Use hex-encoded bytes accepted by strongSwan, supplied only by the deployer."""
-    connections = []
-    secrets = []
-    for link in manifest.links if manifest else ():
-        child_rekey = max(1, link.child_lifetime * 9 // 10)
-        connections.append(
-            f"""    {link.name} {{
-        version = 2
-        local_addrs = {link.source}
-        remote_addrs = {link.peer}
-        proposals = {link.ike_proposal}
-        reauth_time = 0
-        rekey_time = {link.ike_lifetime}s
-        dpd_delay = {link.dpd_delay}s
-        mobike = no
-        encap = yes
-        local {{
-            auth = psk
-            id = {link.local_id}
-        }}
-        remote {{
-            auth = psk
-            id = {link.remote_id}
-        }}
-        children {{
-            {link.child} {{
-                mode = tunnel
-                local_ts = {", ".join(link.local_ts)}
-                remote_ts = {", ".join(link.remote_ts)}
-                esp_proposals = {link.esp_proposal}
-                if_id_in = {link.if_id}
-                if_id_out = {link.if_id}
-                life_time = {link.child_lifetime}s
-                rekey_time = {child_rekey}s
-                start_action = none
-                dpd_action = clear
-                close_action = none
-            }}
-        }}
-    }}"""
-        )
-        if keys is not None:
-            secrets.append(
-                f"""    ike-{link.name} {{
-        id-1 = {link.local_id}
-        id-2 = {link.remote_id}
-        secret = 0x{keys[link.site_id].hex()}
-    }}"""
-            )
-    return "\n".join(["connections {", *connections, "}", "secrets {", *secrets, "}", ""])
+    """Render the same connection settings used by the targeted VICI loader."""
+    links = manifest.links if manifest else ()
+    document = {
+        "connections": {link.name: connection_settings(link) for link in links},
+        "secrets": {
+            f"ike-{link.name}": {
+                "id-1": link.local_id,
+                "id-2": link.remote_id,
+                "secret": "0x" + keys[link.site_id].hex(),
+            }
+            for link in links
+            if keys is not None
+        },
+    }
+    return "\n".join((*_config_lines(document), ""))
 
 
-def nft_config(manifest, token, guarded=(), interfaces=()):
+def nft_config(manifest, token, guarded=(), interfaces=(), handshake=None):
     """A private table; transition guards block all protected traffic."""
     links = manifest.links if manifest else ()
     names = sorted(set(interfaces) | {link.name for link in links})
@@ -208,7 +215,7 @@ def nft_config(manifest, token, guarded=(), interfaces=()):
     lines.extend(
         ["    }", "    chain input {", "        type filter hook input priority -5; policy accept;"]
     )
-    for link in links:
+    for link in handshake.links if handshake else links:
         lines.append(
             f'        iifname "{link.wan}" ip saddr {link.peer} ip daddr {link.source} '
             "udp dport { 500, 4500 } accept"

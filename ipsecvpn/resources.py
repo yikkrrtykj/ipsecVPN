@@ -13,6 +13,7 @@ from .renderer import (
     nft_config,
     swanctl_config,
 )
+from .sa import Snapshot
 from .secureio import Stop, atomic_write, make_directory, remove_file, sync_dir, trusted_dir
 
 SWANCTL_DIR = Path("/etc/swanctl")
@@ -110,7 +111,11 @@ class Resources:
         content = f"delete table ip {TABLE}\n" if owned else ""
         if transition:
             content += nft_config(
-                None, self.token, network_scope(self.candidates), (name for name, _ in self.links)
+                None,
+                self.token,
+                network_scope(self.candidates),
+                (name for name, _ in self.links),
+                handshake=manifest,
             )
         elif manifest:
             content += nft_config(manifest, self.token)
@@ -138,13 +143,14 @@ class Resources:
             mutate=True,
         )
 
-    def guard(self):
-        self.nft(None, transition=True)
+    def guard(self, handshake=None):
+        self.nft(handshake, transition=True)
         owned_routes = self.network()[3]
         for spec in sorted(spec for spec in self.routes - owned_routes if spec[1] == "blackhole"):
             self.route("add", spec)
 
     def load(self, manifest, keys):
+        self.host.assert_exclusive_ike({name for name, _ in self.links})
         make_directory(self.runtime)
         conf = self.runtime / "swanctl.conf"
         atomic_write(conf, swanctl_config(manifest, keys).encode())
@@ -164,8 +170,9 @@ class Resources:
         finally:
             self.purge_runtime()
 
-    def replace(self, target, keys):
+    def replace(self, target, keys, *, loader=None, hold=False):
         self.guard()
+        self.host.assert_exclusive_ike({name for name, _ in self.links})
         _, _, links, routes, names, _, _ = self.network()
         desired_links = link_specs((target,))
         desired_routes = route_specs((target,))
@@ -208,12 +215,20 @@ class Resources:
                 self.host.command("XFRM up", "ip", "link", "set", "dev", name, "up", mutate=True)
         for spec in sorted(desired_routes - self.network()[3]):
             self.route("add", spec)
-        self.load(target, keys)
-        for spec in sorted(self.network()[3] - desired_routes):
+        (loader or self.load)(target, keys)
+        if hold:
+            self.nft(target, transition=True)
+        else:
+            self.finish(target)
+
+    def finish(self, target):
+        for spec in sorted(self.network()[3] - route_specs((target,))):
             self.route("del", spec)
         self.nft(target)
 
-    def verify(self, expected, baseline, nft_sha=None):
+    def verify(self, expected, baseline, nft_sha=None, *, live=None):
+        if live is not None and (not isinstance(live, Snapshot) or live.manifest != expected):
+            raise Stop("The live SA proof does not belong to the expected manifest.")
         _, _, links, routes, names, table, _ = self.network()
         wanted = {name for name, _ in link_specs((expected,))}
         up = {row["ifname"] for row in links if row["ifname"] in names and "UP" in row["flags"]}
@@ -222,7 +237,7 @@ class Resources:
         if bool(table) != bool(expected) or (nft_sha and nft_sha != fingerprint(table)):
             raise Stop("Observed project nftables rules differ from the expected state.")
         connections = self.host.vici_connections()
-        if set(connections) != wanted or self.host.vici("--list-sas").strip():
+        if set(connections) != wanted or (live is None and self.host.vici("--list-sas").strip()):
             raise Stop("The daemon did not report exactly the intended VICI connections.")
         for link in expected.links if expected else ():
             listing = "\n".join(connections[link.name])
@@ -241,6 +256,10 @@ class Resources:
                 lookup = self.host.ip("-4", "route", "get", spec[0].split("/")[0])
                 if len(lookup) != 1 or lookup[0].get("dev") != spec[2]:
                     raise Stop("The kernel did not resolve a protected network through its XFRM.")
-        if self.baseline() != baseline:
-            raise Stop("A protected non-project host baseline changed.")
+        current = self.baseline()
+        if current != baseline:
+            changed = ", ".join(
+                sorted(name for name in current if current[name] != baseline.get(name))
+            )
+            raise Stop(f"A protected non-project host baseline changed ({changed}).")
         return fingerprint(table) if table else None

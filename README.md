@@ -2,7 +2,7 @@
 
 ipsecVPN 面向电竞赛事、场馆和制作团队的三层站点互通。每场赛事通过独立 profile 定义一台 Linux Hub、两个外部站点及获准互通的 IPv4 网段。站点名称和角色、国家和地区、地址、VPS 供应商、运营商及防火墙型号随 profile 变化。外部备网关可以留空，也可登记为人工交接对象。
 
-PR #1 已按 [V2.0 规范](docs/SPEC.md)交付离线配置校验、拓扑计划和参数单。Draft PR #2 增加仅供授权隔离 Ubuntu 24.04 VM 验证的本机部署能力。实际隧道协商和现场业务验收仍待后续 PR。
+PR #1 已按 [V2.0 规范](docs/SPEC.md)交付离线配置校验、拓扑计划和参数单。PR #2 交付授权隔离 Ubuntu 24.04 VM 的本机部署。Draft PR #3 在 Linux Hub 和两个隔离 Linux 对端上验证实际 IKEv2/CHILD 与数据路径。现场厂商设备、真实赛事链路和外部备用切换继续为 SKIP。
 
 ## 本地试用
 
@@ -28,6 +28,7 @@ ipsecvpn export-peer -c config/event.example.yaml --site stage-b --format json
 | `profiles list` | 读取指定目录，默认 `/etc/ipsecvpn/profiles`。显示已保存的赛事和校验结果，活动 profile 为 `SKIP`。 |
 | `validate -c` | 检查 YAML、V2 schema 和拓扑约束。 |
 | `check` | 读取本机发行版信息并查找依赖命令。VICI、SA、XFRM 和真实业务流量为 `SKIP`。 |
+| `status` / `doctor` | 在授权 VM 比对当前 VICI、内核 SA/策略、路由和项目 ACL。默认不发包，业务结果为 `SKIP`。 |
 | `plan -c` | 打印 JSON 拓扑计划，包括两条 XFRM、内外层路由意图及双向 ACL。 |
 | `export-peer` | 向 stdout 输出选定站点视角的 Markdown 或 JSON。现场验收为 `SKIP`。 |
 
@@ -41,6 +42,7 @@ ipsecvpn export-peer -c config/event.example.yaml --site stage-b --format json
 - [赛事配置生命周期与安全](docs/event-lifecycle.md)
 - [P0/P1/P2 能力与 PR #2–#5 验收计划](docs/roadmap.md)
 - [隔离 VM 安装](docs/install.md)、[网络所有权](docs/network-ownership.md)、[备份回滚](docs/rollback.md)与[密钥安全](docs/security.md)
+- [活动 SA 所有权](docs/pr3/SA_OWNERSHIP_DESIGN.md)与 [三节点验收矩阵](docs/pr3/PR3_ACCEPTANCE.md)
 
 ```bash
 python -m pip install '.[dev]'

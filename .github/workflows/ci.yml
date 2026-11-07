@@ -45,10 +45,13 @@ jobs:
           venv/bin/ipsecvpn validate -c profile.yaml
           venv/bin/ipsecvpn plan -c profile.yaml > plan.json
           venv/bin/ipsecvpn render -c profile.yaml --json > render.json
+          venv/bin/ipsecvpn status --json > status.json
+          venv/bin/ipsecvpn doctor --json > doctor.json
           site_id="$(venv/bin/python -c 'import yaml; print(yaml.safe_load(open("profile.yaml"))["sites"][0]["id"])')"
           venv/bin/ipsecvpn export-peer -c profile.yaml --site "$site_id" --format json > handoff.json
           venv/bin/python -c 'import json; assert json.load(open("handoff.json"))["status"] == "PASS"'
           venv/bin/python -c 'import json; assert len(json.load(open("render.json"))["manifest"]["links"]) == 2'
+          venv/bin/python -c 'import json; assert all(json.load(open(name))["data_path"]["status"] == "SKIP" for name in ("status.json", "doctor.json"))'
       - name: Scan reachable commits for secrets
         shell: bash
         run: |
